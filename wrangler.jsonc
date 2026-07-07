@@ -1,0 +1,14 @@
+{
+  // Edge cache for Navi's PC Cafe catalog reads — see src/index.js
+  "name": "natpc-cache",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-01",
+  "routes": [
+    { "pattern": "api.navipcshop.com", "custom_domain": true }
+  ],
+  "vars": {
+    // The publishable (anon) key — already public in the storefront page source
+    "SUPABASE_URL": "https://rpmrmakidwzoxkpehrtp.supabase.co",
+    "SUPABASE_ANON_KEY": "sb_publishable_Ms6_ZprtwxK6nFA9yQmjsg_qqBxJlE7"
+  }
+}
