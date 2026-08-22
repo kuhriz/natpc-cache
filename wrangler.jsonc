@@ -6,6 +6,16 @@
   "routes": [
     { "pattern": "api.navipcshop.com", "custom_domain": true }
   ],
+  // Per-IP edge rate limits for the two fronted write routes (src/index.js
+  // FRONTED). Cloudflare's limiter only does 10s/60s windows; these stop
+  // bursts — the per-actor open-hold caps live in the DB. namespace_id is an
+  // account-unique integer per limiter.
+  "unsafe": {
+    "bindings": [
+      { "name": "EXPRESS_RL", "type": "ratelimit", "namespace_id": "1101", "simple": { "limit": 6,  "period": 60 } },
+      { "name": "CODE_RL",    "type": "ratelimit", "namespace_id": "1102", "simple": { "limit": 10, "period": 60 } }
+    ]
+  },
   "vars": {
     // The publishable (anon) key — already public in the storefront page source
     "SUPABASE_URL": "https://rpmrmakidwzoxkpehrtp.supabase.co",

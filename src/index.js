@@ -10,7 +10,8 @@
 //
 // Scope is deliberately narrow: fully-public catalog data only. Per-buyer data
 // (buyers, reservations, giveaway_entries) and all mutating RPCs must stay
-// direct-to-Supabase and uncached.
+// direct-to-Supabase and uncached — with the 2026-08-22 exception of the two
+// FRONTED write routes below, which pass through uncached with a rate limit.
 //
 // ── 2026-07-19 (drop-readiness pass) ────────────────────────────────────────
 // Three changes, all driven by load-testing ahead of a high-traffic drop:
@@ -54,11 +55,77 @@ const ALLOWED_RPCS = new Set(['get_vault_cards', 'get_member_leaderboard']);
 const MAX_LIMIT = 200;
 const MAX_BODY = 256;
 
+// ── 2026-08-22 (Track 1 anti-abuse) ── FRONTED WRITES ───────────────────────
+// Two mutating endpoints now come through this Worker instead of straight to
+// Supabase: express checkout (the stripe-checkout Edge Function) and the
+// email-code request RPC. The Worker contributes what the origin can't get on
+// its own — a Cloudflare-verified client IP (cf-connecting-ip) and a per-IP
+// rate limit at the edge — and hands both upstream under a shared secret
+// (x-navi-edge / x-navi-ip) so the origin can tell a fronted call from a
+// direct one. Nothing here is cached. The limiters are optional bindings
+// (see wrangler.jsonc); EDGE_SECRET is a `wrangler secret`. With either
+// missing the route still forwards, just without that protection.
+const FRONTED = {
+  '/functions/v1/stripe-checkout':    { limiter: 'EXPRESS_RL' },
+  '/rest/v1/rpc/request_email_code':  { limiter: 'CODE_RL' },
+};
+const MAX_FRONT_BODY = 16384;
+
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'apikey, authorization, content-type',
+  'Access-Control-Allow-Headers': 'apikey, authorization, content-type, prefer',
 };
+
+const jsonResponse = (obj, status) => new Response(JSON.stringify(obj), {
+  status,
+  headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS },
+});
+
+async function front(request, env, url, spec) {
+  const ip = request.headers.get('cf-connecting-ip') || '';
+  const limiter = env[spec.limiter];
+  // X-Edge-RL is a diagnostic: bound|unbound : ip|noip : ok|limited|error
+  let rl = (limiter ? 'bound' : 'unbound') + ':' + (ip ? 'ip' : 'noip');
+  if (limiter && ip) {
+    try {
+      const { success } = await limiter.limit({ key: `${spec.limiter}:${ip}` });
+      rl += success ? ':ok' : ':limited';
+      if (!success) {
+        // Same {error} shape both callers already render
+        const r = jsonResponse({ success: false, error: 'Too many requests — please wait a minute and try again.' }, 429);
+        r.headers.set('X-Edge-RL', rl);
+        return r;
+      }
+    } catch (e) {
+      rl += ':error';   // never let the limiter itself break checkout
+    }
+  }
+  const raw = await request.text();
+  if (raw.length > MAX_FRONT_BODY) return deny('body too large');
+
+  const headers = {
+    'Content-Type': 'application/json',
+    apikey: env.SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
+  };
+  if (env.EDGE_SECRET) headers['x-navi-edge'] = env.EDGE_SECRET;
+  if (ip) headers['x-navi-ip'] = ip;
+
+  let res;
+  try {
+    res = await fetch(env.SUPABASE_URL + url.pathname, { method: 'POST', headers, body: raw });
+  } catch (e) {
+    return jsonResponse({ success: false, error: 'Connection error — please try again.' }, 502);
+  }
+  const body = await res.text();
+  const out = new Headers(CORS);
+  out.set('Content-Type', res.headers.get('Content-Type') || 'application/json');
+  out.set('Cache-Control', 'no-store');
+  out.set('X-Edge-Cache', 'FRONTED');
+  out.set('X-Edge-RL', rl);
+  return new Response(body, { status: res.status, headers: out });
+}
 
 function clientResponse(body, status, contentType, edgeStatus, age) {
   const headers = new Headers(CORS);
@@ -178,6 +245,11 @@ export default {
     }
 
     const url = new URL(request.url);
+
+    // ── Fronted writes (POST, never cached) ──
+    if (request.method === 'POST' && FRONTED[url.pathname]) {
+      return front(request, env, url, FRONTED[url.pathname]);
+    }
 
     // ── Cached table reads (GET) ──
     const table = url.pathname.match(/^\/rest\/v1\/([a-z_]+)$/);
