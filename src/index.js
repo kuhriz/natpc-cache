@@ -105,6 +105,31 @@ function limiterKey(ip) {
   return groups.slice(0, 4).map(g => (parseInt(g, 16) || 0).toString(16)).join(':') + '::/64';
 }
 
+// V14 EM5: the one-click unsubscribe that bulk mail's List-Unsubscribe header
+// points at (RFC 8058). The mail provider POSTs "List-Unsubscribe=One-Click"
+// here, with the buyer's signed unsubscribe token (a random uuid per buyer) in
+// ?t=, and gets a 200 — unsubscribe_buyer is anon-callable and keyed by that
+// token alone. A GET (a person, or a link scanner prefetching) never
+// unsubscribes: it goes to the shop's own ?unsub= page, which asks first.
+const UNSUB_PATH = '/unsubscribe';
+const SHOP = 'https://navipcshop.com';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+async function unsubscribe(request, env, url) {
+  const t = url.searchParams.get('t') || '';
+  if (!UUID_RE.test(t)) return new Response('Not a valid unsubscribe link.', { status: 400, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+  if (request.method !== 'POST') {
+    return Response.redirect(`${SHOP}/?unsub=${encodeURIComponent(t)}`, 302);
+  }
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/unsubscribe_buyer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', apikey: env.SUPABASE_ANON_KEY, Authorization: `Bearer ${env.SUPABASE_ANON_KEY}` },
+    body: JSON.stringify({ p_unsub: t }),
+  });
+  const ok = res.ok;
+  return new Response(ok ? 'You are unsubscribed from Navi\'s PC Cafe promo emails.' : 'Something went wrong — use the Unsubscribe link in the email instead.',
+    { status: ok ? 200 : 502, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+
 async function front(request, env, url, spec) {
   const ip = request.headers.get('cf-connecting-ip') || '';
   const limiter = env[spec.limiter];
@@ -276,6 +301,8 @@ export default {
     }
 
     const url = new URL(request.url);
+
+    if (url.pathname === UNSUB_PATH) return unsubscribe(request, env, url);
 
     // ── Fronted writes (POST, never cached) ──
     if (request.method === 'POST' && FRONTED[url.pathname]) {

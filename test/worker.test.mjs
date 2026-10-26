@@ -94,3 +94,23 @@ test('the limiter keys IPv6 on its /64 and leaves IPv4 alone', async () => {
   // the origin still gets the full address, as before
   assert.equal(upstreamCalls.at(-1).init.headers['x-navi-ip'], '::ffff:203.0.113.7');
 });
+
+test('one-click unsubscribe: POST unsubscribes by the token; GET only goes to the page', async () => {
+  reset();
+  const tok = '0f8c2a6e-1b2c-4d3e-8f90-123456789abc';
+  const post = await worker.fetch(new Request('https://api.test/unsubscribe?t=' + tok, {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'List-Unsubscribe=One-Click',
+  }), env, ctx);
+  assert.equal(post.status, 200);
+  assert.equal(upstreamCalls.length, 1);
+  assert.equal(upstreamCalls[0].url, 'https://origin.test/rest/v1/rpc/unsubscribe_buyer');
+  assert.deepEqual(JSON.parse(upstreamCalls[0].init.body), { p_unsub: tok });
+  reset();
+  const get = await worker.fetch(new Request('https://api.test/unsubscribe?t=' + tok), env, ctx);
+  assert.equal(get.status, 302);
+  assert.equal(get.headers.get('Location'), 'https://navipcshop.com/?unsub=' + tok);
+  assert.equal(upstreamCalls.length, 0, 'a GET never unsubscribes');
+  const bad = await worker.fetch(new Request('https://api.test/unsubscribe?t=nope', { method: 'POST' }), env, ctx);
+  assert.equal(bad.status, 400);
+  assert.equal(upstreamCalls.length, 0);
+});
