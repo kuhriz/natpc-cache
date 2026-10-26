@@ -60,6 +60,15 @@ test('a read with no limit gets 200, in the upstream call and the cache key', as
   assert.equal((await get('/rest/v1/cards?select=id&limit=201')).status, 403);
 });
 
+test('a key may appear once (the range checks read only the first)', async () => {
+  reset();
+  for (const q of ['select=id&limit=10&limit=500', 'select=id&limit=10&offset=0&offset=99999',
+                   'select=id&select=*&limit=10', 'select=id&visibility=eq.listed&visibility=eq.hidden&limit=10']) {
+    assert.equal((await get(`/rest/v1/cards?${q}`)).status, 403, q);
+  }
+  assert.equal(upstreamCalls.length, 0);
+});
+
 test('prototype names are not tables', async () => {
   reset();
   for (const t of ['constructor', '__proto__', 'tostring']) {

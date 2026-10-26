@@ -170,8 +170,12 @@ const deny = (reason) => new Response(JSON.stringify({ error: 'not allowed', rea
 function validateTableQuery(table, params) {
   const allowed = ALLOWED_PARAMS[table];
   if (!allowed) return 'unknown table';
+  // Each key once: the checks below read only the first `limit` / `offset`
+  const seen = new Set();
   for (const key of params.keys()) {
     if (!allowed.has(key)) return `unsupported parameter: ${key}`;
+    if (seen.has(key)) return `repeated parameter: ${key}`;
+    seen.add(key);
   }
   const limit = params.get('limit');
   if (limit !== null && !(Number(limit) >= 0 && Number(limit) <= MAX_LIMIT)) {
