@@ -34,6 +34,14 @@
 //      entirely and let one client drive Supabase directly. Only the query
 //      shapes the storefront actually uses are accepted now; everything else
 //      is rejected at the edge without touching the origin.
+//
+// ── 2026-10-26 (V14, safety pass B) ─────────────────────────────────────────
+//   B3: PostgREST's Max rows (1,000) silently cut the shop's whole-catalog
+//       read, so the shop now reads `cards` in pages: `offset` joins its
+//       allowlist (a bounded integer, so it can't mint endless keys) and the
+//       cache key. PE6: a table read with no `limit` gets MAX_LIMIT, so the
+//       cap holds whatever the caller sends. PE3: the limiters key IPv6 on its
+//       /64, as the database's internal_ip_bucket does.
 
 const FRESH_TTL = 30;   // seconds an entry is served without revalidating
 const STALE_TTL = 600;  // seconds an entry remains servable while refreshing
@@ -42,7 +50,7 @@ const LOCK_TTL = 10;    // best-effort single-flight window for revalidation
 // Per-table allowlist of PostgREST parameters. Derived from every cachedFetch()
 // call site in natpc-shop/index.html — keep in sync when adding a query.
 const ALLOWED_PARAMS = {
-  cards:     new Set(['select', 'order', 'limit', 'visibility', 'status', 'is_permanent', 'is_featured', 'id']),
+  cards:     new Set(['select', 'order', 'limit', 'offset', 'visibility', 'status', 'is_permanent', 'is_featured', 'id']),
   settings:  new Set(['select', 'key']),
   reviews:   new Set(['select', 'order', 'limit', 'visible']),
   giveaways: new Set(['select', 'limit', 'is_active']),
@@ -53,6 +61,7 @@ const ALLOWED_PARAMS = {
 const ALLOWED_RPCS = new Set(['get_vault_cards', 'get_member_leaderboard']);
 
 const MAX_LIMIT = 200;
+const MAX_OFFSET = 10000;
 const MAX_BODY = 256;
 
 // ── 2026-08-22 (Track 1 anti-abuse) ── FRONTED WRITES ───────────────────────
@@ -82,6 +91,20 @@ const jsonResponse = (obj, status) => new Response(JSON.stringify(obj), {
   headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS },
 });
 
+// The limiter's key for a client: IPv4 (and IPv4-mapped) as is, IPv6 as its
+// /64. One phone or home line holds a whole /64, so a per-address key let a
+// client step around the limit by rotating addresses inside it.
+function limiterKey(ip) {
+  if (!ip.includes(':') || ip.includes('.')) return ip;
+  const [head, tail = ''] = ip.toLowerCase().split('::');
+  const h = head ? head.split(':') : [];
+  const t = tail ? tail.split(':') : [];
+  const groups = ip.includes('::')
+    ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t]
+    : h;
+  return groups.slice(0, 4).map(g => (parseInt(g, 16) || 0).toString(16)).join(':') + '::/64';
+}
+
 async function front(request, env, url, spec) {
   const ip = request.headers.get('cf-connecting-ip') || '';
   const limiter = env[spec.limiter];
@@ -89,7 +112,7 @@ async function front(request, env, url, spec) {
   let rl = (limiter ? 'bound' : 'unbound') + ':' + (ip ? 'ip' : 'noip');
   if (limiter && ip) {
     try {
-      const { success } = await limiter.limit({ key: `${spec.limiter}:${ip}` });
+      const { success } = await limiter.limit({ key: `${spec.limiter}:${limiterKey(ip)}` });
       rl += success ? ':ok' : ':limited';
       if (!success) {
         // Same {error} shape both callers already render
@@ -153,6 +176,10 @@ function validateTableQuery(table, params) {
   const limit = params.get('limit');
   if (limit !== null && !(Number(limit) >= 0 && Number(limit) <= MAX_LIMIT)) {
     return `limit out of range (max ${MAX_LIMIT})`;
+  }
+  const offset = params.get('offset');
+  if (offset !== null && !(/^\d{1,5}$/.test(offset) && Number(offset) <= MAX_OFFSET)) {
+    return `offset out of range (max ${MAX_OFFSET})`;
   }
   return null;
 }
@@ -253,9 +280,12 @@ export default {
 
     // ── Cached table reads (GET) ──
     const table = url.pathname.match(/^\/rest\/v1\/([a-z_]+)$/);
-    if (request.method === 'GET' && table && ALLOWED_PARAMS[table[1]]) {
+    // hasOwn: `constructor` / `__proto__` are not tables
+    if (request.method === 'GET' && table && Object.hasOwn(ALLOWED_PARAMS, table[1])) {
       const bad = validateTableQuery(table[1], url.searchParams);
       if (bad) return deny(bad);
+      // A read with no limit would get PostgREST's Max rows (1,000): cap it here too
+      if (!url.searchParams.has('limit')) url.searchParams.set('limit', String(MAX_LIMIT));
       const search = canonicalSearch(url.searchParams);
       return serve(env, ctx, {
         cacheKey: new Request(`${url.origin}${url.pathname}?${search}`),
