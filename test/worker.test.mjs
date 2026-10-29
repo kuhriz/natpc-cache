@@ -95,6 +95,44 @@ test('the limiter keys IPv6 on its /64 and leaves IPv4 alone', async () => {
   assert.equal(upstreamCalls.at(-1).init.headers['x-navi-ip'], '::ffff:203.0.113.7');
 });
 
+test('a signed-in checkout skips the per-network limit; a guest Express start keeps it', async () => {
+  reset();
+  const keys = [];
+  const envRl = { ...env, EXPRESS_RL: { async limit({ key }) { keys.push(key); return { success: false }; } } };
+  const post = body => worker.fetch(new Request('https://api.test/functions/v1/stripe-checkout', {
+    method: 'POST', body: JSON.stringify(body), headers: { 'cf-connecting-ip': '203.0.113.9' },
+  }), envRl, ctx);
+  // the account lane and its release reach the origin, unlimited
+  let r = await post({ account: true, token: 't', order_group_id: 'co_1_abc', items: [{ card_id: 'x' }] });
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get('X-Edge-RL'), 'bound:ip:account');
+  r = await post({ action: 'release_checkout', order_group_id: 'co_1_abc', token: 't' });
+  assert.equal(r.status, 200);
+  assert.equal(keys.length, 0);
+  assert.equal(upstreamCalls.length, 2);
+  assert.equal(upstreamCalls[0].init.headers['x-navi-ip'], '203.0.113.9');
+  // Express, its release, an account body with no token, and junk are all limited
+  for (const body of [{ express: true, items: [] }, { action: 'release_express', order_group_id: 'xp_1' },
+                      { action: 'release_checkout', order_group_id: 'xp_1' }, { account: true }, { account: 'true', token: 't' }]) {
+    r = await post(body);
+    assert.equal(r.status, 429, JSON.stringify(body));
+  }
+  r = await worker.fetch(new Request('https://api.test/functions/v1/stripe-checkout', {
+    method: 'POST', body: 'not json', headers: { 'cf-connecting-ip': '203.0.113.9' } }), envRl, ctx);
+  assert.equal(r.status, 429);
+  assert.equal(keys.length, 6);
+  assert.equal(upstreamCalls.length, 2);
+});
+
+test('a fronted body over the cap is refused before anything else', async () => {
+  reset();
+  const big = JSON.stringify({ account: true, token: 't', pad: 'x'.repeat(20000) });
+  const r = await worker.fetch(new Request('https://api.test/functions/v1/stripe-checkout', {
+    method: 'POST', body: big, headers: { 'cf-connecting-ip': '203.0.113.9' } }), env, ctx);
+  assert.equal(r.status, 403);
+  assert.equal(upstreamCalls.length, 0);
+});
+
 test('one-click unsubscribe: POST unsubscribes by the token; GET only goes to the page', async () => {
   reset();
   const tok = '0f8c2a6e-1b2c-4d3e-8f90-123456789abc';

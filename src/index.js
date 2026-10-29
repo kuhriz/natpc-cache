@@ -75,10 +75,22 @@ const MAX_BODY = 256;
 // (see wrangler.jsonc); EDGE_SECRET is a `wrangler secret`. With either
 // missing the route still forwards, just without that protection.
 const FRONTED = {
-  '/functions/v1/stripe-checkout':    { limiter: 'EXPRESS_RL' },
+  '/functions/v1/stripe-checkout':    { limiter: 'EXPRESS_RL', unlimited: isAccountCheckout },
   '/rest/v1/rpc/request_email_code':  { limiter: 'CODE_RL' },
 };
 const MAX_FRONT_BODY = 16384;
+
+// V14 checkout-03: a signed-in checkout (and letting go of one) skips the
+// per-network limit. It is token-gated and capped per buyer in the database
+// (3 open checkouts, 40 cards), and on drop night a whole carrier can share one
+// address; the limit is for the guest hold, which needs no identity at all.
+function isAccountCheckout(raw) {
+  let b;
+  try { b = JSON.parse(raw); } catch { return false; }
+  if (!b || typeof b !== 'object') return false;
+  if (b.account === true) return typeof b.token === 'string' && b.token.length > 0;
+  return b.action === 'release_checkout' && /^co_/.test(String(b.order_group_id || ''));
+}
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -132,10 +144,15 @@ async function unsubscribe(request, env, url) {
 
 async function front(request, env, url, spec) {
   const ip = request.headers.get('cf-connecting-ip') || '';
+  if (Number(request.headers.get('content-length') || 0) > MAX_FRONT_BODY) return deny('body too large');
+  const raw = await request.text();
+  if (raw.length > MAX_FRONT_BODY) return deny('body too large');
   const limiter = env[spec.limiter];
-  // X-Edge-RL is a diagnostic: bound|unbound : ip|noip : ok|limited|error
+  // X-Edge-RL is a diagnostic: bound|unbound : ip|noip : ok|limited|error|account
   let rl = (limiter ? 'bound' : 'unbound') + ':' + (ip ? 'ip' : 'noip');
-  if (limiter && ip) {
+  if (spec.unlimited && spec.unlimited(raw)) {
+    rl += ':account';
+  } else if (limiter && ip) {
     try {
       const { success } = await limiter.limit({ key: `${spec.limiter}:${limiterKey(ip)}` });
       rl += success ? ':ok' : ':limited';
@@ -149,8 +166,6 @@ async function front(request, env, url, spec) {
       rl += ':error';   // never let the limiter itself break checkout
     }
   }
-  const raw = await request.text();
-  if (raw.length > MAX_FRONT_BODY) return deny('body too large');
 
   const headers = {
     'Content-Type': 'application/json',
