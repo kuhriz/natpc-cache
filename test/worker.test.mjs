@@ -95,32 +95,37 @@ test('the limiter keys IPv6 on its /64 and leaves IPv4 alone', async () => {
   assert.equal(upstreamCalls.at(-1).init.headers['x-navi-ip'], '::ffff:203.0.113.7');
 });
 
-test('a signed-in checkout skips the per-network limit; a guest Express start keeps it', async () => {
+test('a signed-in checkout and its release get the roomier account limit; everything else the Express one', async () => {
   reset();
   const keys = [];
-  const envRl = { ...env, EXPRESS_RL: { async limit({ key }) { keys.push(key); return { success: false }; } } };
+  const limiter = name => ({ async limit({ key }) { keys.push(key); return { success: name === 'ACCOUNT_RL' }; } });
+  const envRl = { ...env, EXPRESS_RL: limiter('EXPRESS_RL'), ACCOUNT_RL: limiter('ACCOUNT_RL') };
   const post = body => worker.fetch(new Request('https://api.test/functions/v1/stripe-checkout', {
-    method: 'POST', body: JSON.stringify(body), headers: { 'cf-connecting-ip': '203.0.113.9' },
+    method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body), headers: { 'cf-connecting-ip': '203.0.113.9' },
   }), envRl, ctx);
-  // the account lane and its release reach the origin, unlimited
+  // the account lane and its release: ACCOUNT_RL (which lets them through here)
   let r = await post({ account: true, token: 't', order_group_id: 'co_1_abc', items: [{ card_id: 'x' }] });
   assert.equal(r.status, 200);
-  assert.equal(r.headers.get('X-Edge-RL'), 'bound:ip:account');
+  assert.equal(r.headers.get('X-Edge-RL'), 'bound:ip:ACCOUNT_RL:ok');
   r = await post({ action: 'release_checkout', order_group_id: 'co_1_abc', token: 't' });
   assert.equal(r.status, 200);
-  assert.equal(keys.length, 0);
+  assert.deepEqual(keys, ['ACCOUNT_RL:203.0.113.9', 'ACCOUNT_RL:203.0.113.9']);
   assert.equal(upstreamCalls.length, 2);
   assert.equal(upstreamCalls[0].init.headers['x-navi-ip'], '203.0.113.9');
-  // Express, its release, an account body with no token, and junk are all limited
-  for (const body of [{ express: true, items: [] }, { action: 'release_express', order_group_id: 'xp_1' },
-                      { action: 'release_checkout', order_group_id: 'xp_1' }, { account: true }, { account: 'true', token: 't' }]) {
+  // anything not plainly that lane gets EXPRESS_RL (which refuses here) — a
+  // body naming both lanes above all (stripe-checkout runs express first)
+  keys.length = 0;
+  for (const body of [{ express: true, items: [] }, { express: true, account: true, token: 't' },
+                      { account: true, action: 'release_express', token: 't' }, { account: true },
+                      { account: 'true', token: 't' }, { action: 'release_express', order_group_id: 'xp_1' },
+                      { action: 'release_checkout', order_group_id: 'xp_1' },
+                      { action: 'release_checkout', order_group_id: 'co_1', express: true }, 'not json']) {
     r = await post(body);
     assert.equal(r.status, 429, JSON.stringify(body));
+    assert.equal(r.headers.get('X-Edge-RL'), 'bound:ip:EXPRESS_RL:limited');
   }
-  r = await worker.fetch(new Request('https://api.test/functions/v1/stripe-checkout', {
-    method: 'POST', body: 'not json', headers: { 'cf-connecting-ip': '203.0.113.9' } }), envRl, ctx);
-  assert.equal(r.status, 429);
-  assert.equal(keys.length, 6);
+  assert.equal(keys.length, 9);
+  assert.ok(keys.every(k => k.startsWith('EXPRESS_RL:')));
   assert.equal(upstreamCalls.length, 2);
 });
 

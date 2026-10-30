@@ -75,21 +75,27 @@ const MAX_BODY = 256;
 // (see wrangler.jsonc); EDGE_SECRET is a `wrangler secret`. With either
 // missing the route still forwards, just without that protection.
 const FRONTED = {
-  '/functions/v1/stripe-checkout':    { limiter: 'EXPRESS_RL', unlimited: isAccountCheckout },
+  '/functions/v1/stripe-checkout':    { limiter: 'EXPRESS_RL', pick: checkoutLimiter },
   '/rest/v1/rpc/request_email_code':  { limiter: 'CODE_RL' },
 };
 const MAX_FRONT_BODY = 16384;
 
-// V14 checkout-03: a signed-in checkout (and letting go of one) skips the
-// per-network limit. It is token-gated and capped per buyer in the database
-// (3 open checkouts, 40 cards), and on drop night a whole carrier can share one
-// address; the limit is for the guest hold, which needs no identity at all.
-function isAccountCheckout(raw) {
+// V14 checkout-03: a signed-in checkout — starting one, or letting one go —
+// gets its own, roomier per-network limit (ACCOUNT_RL, 30 a minute): it is
+// token-gated and capped per buyer in the database (open holds, 10 starts in
+// 10 minutes), and on drop night a whole carrier can share one address. The
+// guest hold (Express), which needs no identity, keeps EXPRESS_RL. A body has
+// to be plainly one lane to get the roomier limit (stripe-checkout refuses a
+// body that names both).
+function checkoutLimiter(raw) {
   let b;
-  try { b = JSON.parse(raw); } catch { return false; }
-  if (!b || typeof b !== 'object') return false;
-  if (b.account === true) return typeof b.token === 'string' && b.token.length > 0;
-  return b.action === 'release_checkout' && /^co_/.test(String(b.order_group_id || ''));
+  try { b = JSON.parse(raw); } catch { return 'EXPRESS_RL'; }
+  if (!b || typeof b !== 'object') return 'EXPRESS_RL';
+  const start = b.account === true && b.express === undefined && b.action === undefined
+    && typeof b.token === 'string' && b.token.length > 0;
+  const release = b.action === 'release_checkout' && b.express === undefined && b.account === undefined
+    && /^co_/.test(String(b.order_group_id || ''));
+  return start || release ? 'ACCOUNT_RL' : 'EXPRESS_RL';
 }
 
 const CORS = {
@@ -147,14 +153,13 @@ async function front(request, env, url, spec) {
   if (Number(request.headers.get('content-length') || 0) > MAX_FRONT_BODY) return deny('body too large');
   const raw = await request.text();
   if (raw.length > MAX_FRONT_BODY) return deny('body too large');
-  const limiter = env[spec.limiter];
-  // X-Edge-RL is a diagnostic: bound|unbound : ip|noip : ok|limited|error|account
-  let rl = (limiter ? 'bound' : 'unbound') + ':' + (ip ? 'ip' : 'noip');
-  if (spec.unlimited && spec.unlimited(raw)) {
-    rl += ':account';
-  } else if (limiter && ip) {
+  const limiterName = spec.pick ? spec.pick(raw) : spec.limiter;
+  const limiter = env[limiterName];
+  // X-Edge-RL is a diagnostic: bound|unbound : ip|noip [: the limiter, when picked] : ok|limited|error
+  let rl = (limiter ? 'bound' : 'unbound') + ':' + (ip ? 'ip' : 'noip') + (spec.pick ? ':' + limiterName : '');
+  if (limiter && ip) {
     try {
-      const { success } = await limiter.limit({ key: `${spec.limiter}:${limiterKey(ip)}` });
+      const { success } = await limiter.limit({ key: `${limiterName}:${limiterKey(ip)}` });
       rl += success ? ':ok' : ':limited';
       if (!success) {
         // Same {error} shape both callers already render

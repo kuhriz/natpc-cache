@@ -13,7 +13,9 @@
   "unsafe": {
     "bindings": [
       { "name": "EXPRESS_RL", "type": "ratelimit", "namespace_id": "1101", "simple": { "limit": 6,  "period": 60 } },
-      { "name": "CODE_RL",    "type": "ratelimit", "namespace_id": "1102", "simple": { "limit": 10, "period": 60 } }
+      { "name": "CODE_RL",    "type": "ratelimit", "namespace_id": "1102", "simple": { "limit": 10, "period": 60 } },
+      // V14 checkout-03: signed-in checkouts and their releases (token-gated, capped per buyer in the database)
+      { "name": "ACCOUNT_RL", "type": "ratelimit", "namespace_id": "1103", "simple": { "limit": 30, "period": 60 } }
     ]
   },
   "vars": {
