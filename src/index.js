@@ -179,6 +179,10 @@ async function front(request, env, url, spec) {
   };
   if (env.EDGE_SECRET) headers['x-navi-edge'] = env.EDGE_SECRET;
   if (ip) headers['x-navi-ip'] = ip;
+  // The shop's user agent, for stripe-checkout's "how it went" record (V14 telemetry, 10-30): it keeps
+  // only the kind of browser and device, and trusts this header only behind the edge secret.
+  const ua = request.headers.get('user-agent');
+  if (ua && url.pathname === '/functions/v1/stripe-checkout') headers['x-navi-ua'] = ua.slice(0, 400);
 
   let res;
   try {

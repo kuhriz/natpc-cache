@@ -157,3 +157,24 @@ test('one-click unsubscribe: POST unsubscribes by the token; GET only goes to th
   assert.equal(bad.status, 400);
   assert.equal(upstreamCalls.length, 0);
 });
+
+test("a checkout carries the shop's user agent (only the kind is kept upstream); a code request doesn't", async () => {
+  reset();
+  const ok = { async limit() { return { success: true }; } };
+  const envRl = { ...env, EXPRESS_RL: ok, ACCOUNT_RL: ok, CODE_RL: ok };
+  const ua = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) Mobile/22G86 Barcelona 401.0.0.32.110';
+  await worker.fetch(new Request('https://api.test/functions/v1/stripe-checkout', {
+    method: 'POST', body: JSON.stringify({ account: true, token: 't', order_group_id: 'co_1_abc', items: [] }),
+    headers: { 'cf-connecting-ip': '203.0.113.9', 'user-agent': ua },
+  }), envRl, ctx);
+  assert.equal(upstreamCalls.at(-1).init.headers['x-navi-ua'], ua);
+  await worker.fetch(new Request('https://api.test/functions/v1/stripe-checkout', {
+    method: 'POST', body: JSON.stringify({ account: true, token: 't', order_group_id: 'co_1_abc', items: [] }),
+    headers: { 'cf-connecting-ip': '203.0.113.9', 'user-agent': 'x'.repeat(1000) },
+  }), envRl, ctx);
+  assert.equal(upstreamCalls.at(-1).init.headers['x-navi-ua'].length, 400);
+  await worker.fetch(new Request('https://api.test/rest/v1/rpc/request_email_code', {
+    method: 'POST', body: JSON.stringify({ p_email: 'a@b.test' }), headers: { 'cf-connecting-ip': '203.0.113.9', 'user-agent': ua },
+  }), envRl, ctx);
+  assert.equal(upstreamCalls.at(-1).init.headers['x-navi-ua'], undefined);
+});
